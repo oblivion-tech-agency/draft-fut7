@@ -36,9 +36,12 @@ export const Header: React.FC = () => {
             Soporte
           </a>
         </nav>
-        <button className="flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-5 bg-primary/10 border border-primary/30 text-primary hover:bg-primary hover:text-background-dark text-sm font-bold transition-all">
+        <Link
+          href="/draft7/admin"
+          className="flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-5 bg-primary/10 border border-primary/30 text-primary hover:bg-primary hover:text-background-dark text-sm font-bold transition-all"
+        >
           <span className="truncate">Iniciar Sesión</span>
-        </button>
+        </Link>
       </div>
     </header>
   );
