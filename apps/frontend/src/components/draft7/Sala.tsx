@@ -4,7 +4,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
-import { Room, DraftState, CaptainRole, Player } from '@/types/draft7';
+import { Room, DraftState, CaptainRole, Player, TeamLineup } from '@/types/draft7';
 import {
   Search,
   Eye,
@@ -48,6 +48,7 @@ import { Pitch } from './sala/Pitch';
 import { PlayerAvatar } from './sala/PlayerAvatar';
 
 const POLL_INTERVAL_MS = 4000;
+const MAX_SAVE_TRIES = 3;
 const SOUND_KEY = 'draft7_sound';
 
 const captainOf = (state: DraftState, team: Team) =>
@@ -686,6 +687,7 @@ const DraftScreen: React.FC<{
   onToggleSound: () => void;
   onEnableNotifications: () => void;
   onPick: (playerId: string) => void;
+  onLineupChange: (lineup: TeamLineup) => void;
 }> = ({
   state,
   role,
@@ -697,6 +699,7 @@ const DraftScreen: React.FC<{
   onToggleSound,
   onEnableNotifications,
   onPick,
+  onLineupChange,
 }) => {
   const myTeam = role === 'spectator' ? null : role;
   const canPick = !!myTeam && myTeam === state.currentTurn && !state.isComplete;
@@ -741,7 +744,13 @@ const DraftScreen: React.FC<{
 
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] xl:grid-cols-[minmax(0,560px)_minmax(0,1fr)] gap-4 items-start">
         <div className={cn('flex justify-center', canPick && 'order-2 lg:order-none')}>
-          <Pitch state={state} avatars={avatars} className="max-w-[560px]" />
+          <Pitch
+            state={state}
+            avatars={avatars}
+            editableTeam={myTeam}
+            onLineupChange={onLineupChange}
+            className="max-w-[560px]"
+          />
         </div>
         <div className={cn('flex flex-col gap-4', canPick && 'order-1 lg:order-none')}>
           <AvailablePlayers
@@ -760,7 +769,12 @@ const DraftScreen: React.FC<{
 };
 
 // ─── RESULTS SCREEN ──────────────────────────────────────────────────────────
-const ResultsScreen: React.FC<{ state: DraftState; avatars: AvatarMap }> = ({ state, avatars }) => {
+const ResultsScreen: React.FC<{
+  state: DraftState;
+  role: CaptainRole;
+  avatars: AvatarMap;
+  onLineupChange: (lineup: TeamLineup) => void;
+}> = ({ state, role, avatars, onLineupChange }) => {
   const [copied, setCopied] = useState(false);
   const teamA = teamPlayers(state, 'A');
   const teamB = teamPlayers(state, 'B');
@@ -841,7 +855,13 @@ const ResultsScreen: React.FC<{ state: DraftState; avatars: AvatarMap }> = ({ st
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,520px)_minmax(0,1fr)] gap-6 items-start">
-        <Pitch state={state} avatars={avatars} className="mx-auto max-w-[520px]" />
+        <Pitch
+          state={state}
+          avatars={avatars}
+          editableTeam={role === 'spectator' ? null : role}
+          onLineupChange={onLineupChange}
+          className="mx-auto max-w-[520px]"
+        />
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-4">
           <TeamList team="A" players={teamA} />
           <TeamList team="B" players={teamB} />
@@ -874,7 +894,12 @@ export const Sala: React.FC<{ roomId: string }> = ({ roomId }) => {
   /** Aplica un estado recibido, ignorando versiones más viejas que la actual. */
   const receiveState = useCallback((incoming: DraftState) => {
     setState((current) => {
-      if (current && picksMade(incoming) < picksMade(current)) return current;
+      if (
+        current &&
+        ((incoming.rev ?? 0) < (current.rev ?? 0) || picksMade(incoming) < picksMade(current))
+      ) {
+        return current;
+      }
       return incoming;
     });
   }, []);
@@ -1030,45 +1055,84 @@ export const Sala: React.FC<{ roomId: string }> = ({ roomId }) => {
     if (soundOn) playYourTurn();
   }, [soundOn]);
 
+  /**
+   * Guarda un cambio partiendo del estado más reciente de la base. Cada
+   * escritura sube `rev` y solo se aplica si nadie escribió en el medio (si no,
+   * reintenta), así acomodar la táctica nunca pisa un pick del otro capitán.
+   * `mutate` devuelve el nuevo estado o un mensaje de error.
+   */
+  const saveState = useCallback(
+    async (mutate: (latest: DraftState) => DraftState | string): Promise<string | null> => {
+      for (let attempt = 0; attempt < MAX_SAVE_TRIES; attempt++) {
+        const latest = (await fetchState())?.state;
+        if (!latest) return 'No se pudo conectar. Probá de nuevo.';
+        const result = mutate(latest);
+        if (typeof result === 'string') {
+          receiveState(latest);
+          return result;
+        }
+
+        const next: DraftState = { ...result, rev: (latest.rev ?? 0) + 1 };
+        setState(next);
+
+        const update = supabase.from('rooms').update({ state: next }).eq('id', roomId);
+        const { data, error } = await (
+          latest.rev === undefined
+            ? update.is('state->>rev', null)
+            : update.eq('state->>rev', String(latest.rev))
+        ).select('id');
+        if (error) {
+          setState(latest);
+          return 'No se pudo guardar. Probá de nuevo.';
+        }
+        if (data.length > 0) {
+          channelRef.current?.send({
+            type: 'broadcast',
+            event: 'state_update',
+            payload: { state: next },
+          });
+          return null;
+        }
+        // Otro cliente escribió en el medio: reintentar sobre su versión.
+      }
+      fetchState().then((d) => d && setState(d.state));
+      return 'Hubo un conflicto al guardar. Probá de nuevo.';
+    },
+    [roomId, fetchState, receiveState]
+  );
+
   const handlePick = useCallback(
     async (playerId: string) => {
       if (!state || !role || role === 'spectator' || picking) return;
       setPicking(true);
       setPickError(null);
 
-      // Partir del estado más reciente para no pisar un pick del otro capitán
-      const latest = (await fetchState())?.state ?? state;
-      if (latest.currentTurn !== role || latest.isComplete) {
-        receiveState(latest);
-        setPickError('Ya no es tu turno.');
-        setPicking(false);
-        return;
-      }
-      if (latest.players.find((p) => p.id === playerId)?.pickedBy) {
-        receiveState(latest);
-        setPickError('Ese jugador ya fue elegido.');
-        setPicking(false);
-        return;
-      }
-
-      const newState = applyPick(latest, playerId);
-      setState(newState);
-
-      const [{ error }] = await Promise.all([
-        supabase.from('rooms').update({ state: newState }).eq('id', roomId),
-        channelRef.current?.send({
-          type: 'broadcast',
-          event: 'state_update',
-          payload: { state: newState },
-        }),
-      ]);
-      if (error) {
-        setPickError('No se pudo guardar el pick. Probá de nuevo.');
-        setState(latest);
-      }
+      const error = await saveState((latest) => {
+        if (latest.currentTurn !== role || latest.isComplete) return 'Ya no es tu turno.';
+        if (latest.players.find((p) => p.id === playerId)?.pickedBy) {
+          return 'Ese jugador ya fue elegido.';
+        }
+        return applyPick(latest, playerId);
+      });
+      if (error) setPickError(error);
       setPicking(false);
     },
-    [state, role, roomId, picking, fetchState, receiveState]
+    [state, role, picking, saveState]
+  );
+
+  const handleLineupChange = useCallback(
+    async (lineup: TeamLineup) => {
+      if (role !== 'A' && role !== 'B') return;
+      const withLineup = (s: DraftState): DraftState => ({
+        ...s,
+        lineups: { ...s.lineups, [role]: lineup },
+      });
+      // Se ve al instante; la escritura confirma (o corrige) después.
+      setState((s) => s && { ...withLineup(s), rev: (s.rev ?? 0) + 1 });
+      const error = await saveState(withLineup);
+      if (error) setPickError(error);
+    },
+    [role, saveState]
   );
 
   useEffect(() => {
@@ -1115,7 +1179,14 @@ export const Sala: React.FC<{ roomId: string }> = ({ roomId }) => {
       <JoinScreen roomId={roomId} room={room} state={state} avatars={avatars} onJoin={handleJoin} />
     );
   } else if (state && role && state.isComplete) {
-    content = <ResultsScreen state={state} avatars={avatars} />;
+    content = (
+      <ResultsScreen
+        state={state}
+        role={role}
+        avatars={avatars}
+        onLineupChange={handleLineupChange}
+      />
+    );
   } else if (state && role) {
     content = (
       <DraftScreen
@@ -1129,6 +1200,7 @@ export const Sala: React.FC<{ roomId: string }> = ({ roomId }) => {
         onToggleSound={handleToggleSound}
         onEnableNotifications={handleEnableNotifications}
         onPick={handlePick}
+        onLineupChange={handleLineupChange}
       />
     );
   }
