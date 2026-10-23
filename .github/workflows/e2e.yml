@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: '20.x'
+  NODE_VERSION: '24.x'
   PNPM_VERSION: '9.0.0'
   # Valores dummy: el build prerenderiza páginas que crean el cliente de
   # Supabase a nivel módulo y falla sin URL. No se usan para nada real.
